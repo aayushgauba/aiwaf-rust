@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::{PyAny, PyDict, PyList};
 use pyo3::FromPyObject;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -315,6 +315,50 @@ fn keyword_hits(path_lower: &str, keywords: &[String], enabled: bool) -> i32 {
         .count() as i32
 }
 
+
+fn state_to_timestamp_index(state: Option<&Bound<'_, PyAny>>) -> PyResult<HashMap<String, Vec<f64>>> {
+    let mut map: HashMap<String, Vec<f64>> = HashMap::new();
+
+    let Some(state_any) = state else {
+        return Ok(map);
+    };
+
+    let state_dict = state_any.downcast::<PyDict>()?;
+    let Some(ts_any) = state_dict.get_item("timestamps_by_ip")? else {
+        return Ok(map);
+    };
+    let ts_dict = ts_any.downcast::<PyDict>()?;
+
+    for (ip_obj, values_obj) in ts_dict.iter() {
+        let ip: String = ip_obj.extract()?;
+        let list = values_obj.downcast::<PyList>()?;
+        let mut vals = Vec::with_capacity(list.len());
+        for value in list.iter() {
+            vals.push(value.extract::<f64>()?);
+        }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        map.insert(ip, vals);
+    }
+
+    Ok(map)
+}
+
+fn timestamp_index_to_state<'py>(
+    py: Python<'py>,
+    timestamp_index: &HashMap<String, Vec<f64>>,
+) -> PyResult<Py<PyDict>> {
+    let state = PyDict::new_bound(py);
+    let ts_dict = PyDict::new_bound(py);
+
+    for (ip, values) in timestamp_index.iter() {
+        let values_list = PyList::new_bound(py, values.iter().copied());
+        ts_dict.set_item(ip, values_list)?;
+    }
+
+    state.set_item("timestamps_by_ip", ts_dict)?;
+    Ok(state.into())
+}
+
 fn lower_bound(values: &[f64], target: f64) -> usize {
     let mut left = 0usize;
     let mut right = values.len();
@@ -436,6 +480,66 @@ fn extract_features<'py>(
     Ok(output)
 }
 
+
+#[pyfunction]
+fn extract_features_batch_with_state<'py>(
+    py: Python<'py>,
+    records: Vec<FeatureRecordInput>,
+    static_keywords: Vec<String>,
+    state: Option<Bound<'py, PyAny>>,
+) -> PyResult<Py<PyDict>> {
+    let keywords: Vec<String> = static_keywords
+        .into_iter()
+        .map(|kw| kw.to_lowercase())
+        .collect();
+
+    let mut timestamp_index = state_to_timestamp_index(state.as_ref())?;
+
+    for rec in records.iter() {
+        timestamp_index
+            .entry(rec.ip.clone())
+            .or_default()
+            .push(rec.timestamp);
+    }
+    for timestamps in timestamp_index.values_mut() {
+        timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let mut features: Vec<Py<PyDict>> = Vec::with_capacity(records.len());
+    for rec in records.into_iter() {
+        let timestamps = timestamp_index.get(&rec.ip);
+        let burst = count_burst(timestamps, rec.timestamp);
+        let kw = keyword_hits(&rec.path_lower, &keywords, rec.kw_check);
+
+        let feature = PyDict::new_bound(py);
+        feature.set_item("ip", rec.ip.clone())?;
+        feature.set_item("path_len", rec.path_len)?;
+        feature.set_item("kw_hits", kw)?;
+        feature.set_item("resp_time", rec.response_time)?;
+        feature.set_item("status_idx", rec.status_idx)?;
+        feature.set_item("burst_count", burst)?;
+        feature.set_item("total_404", rec.total_404)?;
+        features.push(feature.into());
+    }
+
+    let result = PyDict::new_bound(py);
+    result.set_item("features", features)?;
+    result.set_item("state", timestamp_index_to_state(py, &timestamp_index)?)?;
+    Ok(result.into())
+}
+
+#[pyfunction]
+fn finalize_feature_state<'py>(
+    py: Python<'py>,
+    _static_keywords: Vec<String>,
+    _state: Option<Bound<'py, PyAny>>,
+) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new_bound(py);
+    let empty: Vec<Py<PyDict>> = Vec::new();
+    result.set_item("features", empty)?;
+    Ok(result.into())
+}
+
 #[pyfunction]
 fn analyze_recent_behavior<'py>(
     py: Python<'py>,
@@ -516,6 +620,8 @@ fn aiwaf_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_headers, m)?)?;
     m.add_function(wrap_pyfunction!(validate_headers_with_config, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_features_batch_with_state, m)?)?;
+    m.add_function(wrap_pyfunction!(finalize_feature_state, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_recent_behavior, m)?)?;
     Ok(())
 }
