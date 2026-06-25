@@ -9,7 +9,7 @@ use aiwaf_core::{
     rust_payload_from_records as core_rust_payload_from_records,
     validate_headers_with_config as core_validate_headers_with_config,
 };
-use js_sys::{Array, Function};
+use js_sys::{Array, Function, Map};
 use serde_wasm_bindgen::{from_value, to_value};
 use std::collections::HashMap;
 use wasm_bindgen::JsCast;
@@ -440,11 +440,20 @@ fn parse_config_object(value: JsValue) -> Result<JsForestConfig, JsValue> {
 }
 
 fn get_value(obj: &js_sys::Object, key: &str) -> Option<JsValue> {
-    let v = js_sys::Reflect::get(obj, &JsValue::from_str(key)).ok()?;
-    if v.is_undefined() || v.is_null() {
+    let key = JsValue::from_str(key);
+    if let Ok(value) = js_sys::Reflect::get(obj, &key) {
+        if !value.is_undefined() && !value.is_null() {
+            return Some(value);
+        }
+    }
+
+    let value = JsValue::from(obj.clone());
+    let map = value.dyn_ref::<Map>()?;
+    let value = map.get(&key);
+    if value.is_undefined() || value.is_null() {
         None
     } else {
-        Some(v)
+        Some(value)
     }
 }
 
@@ -530,6 +539,28 @@ fn parse_built_record(value: JsValue) -> Result<BuiltFeatureRecord, JsValue> {
 
 fn parse_ip_times(value: JsValue) -> Result<HashMap<String, Vec<f64>>, JsValue> {
     if let Ok(map) = from_value::<HashMap<String, Vec<f64>>>(value.clone()) {
+        return Ok(map);
+    }
+
+    if let Some(js_map) = value.dyn_ref::<Map>() {
+        let entries = Array::from(&js_map.entries());
+        let mut map = HashMap::new();
+        for entry in entries.iter() {
+            let pair = Array::from(&entry);
+            if pair.length() < 2 {
+                continue;
+            }
+            let key = pair.get(0).as_string().unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            let values = Array::from(&pair.get(1));
+            let mut timestamps = Vec::with_capacity(values.length() as usize);
+            for value in values.iter() {
+                timestamps.push(timestamp_epoch(value)?);
+            }
+            map.insert(key, timestamps);
+        }
         return Ok(map);
     }
 

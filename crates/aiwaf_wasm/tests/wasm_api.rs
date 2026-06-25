@@ -5,6 +5,7 @@ use aiwaf_wasm::{
 };
 use js_sys::Array;
 use serde_wasm_bindgen::{from_value, to_value};
+use std::collections::HashMap;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use web_sys::Headers;
@@ -85,24 +86,24 @@ fn test_extract_features_and_state() {
 
 #[wasm_bindgen_test]
 fn test_training_record_helpers() {
-    let parsed = to_value(&serde_json::json!([
-        {
-            "ip": "1.2.3.4",
-            "path": "/wp-admin",
-            "response_time": 0.03,
-            "status": 404,
-            "timestamp": 10.0
+    let parsed = to_value(&vec![
+        aiwaf_core::ParsedFeatureRecord {
+            ip: "1.2.3.4".to_string(),
+            path: "/wp-admin".to_string(),
+            response_time: 0.03,
+            status: 404,
+            timestamp: 10.0,
         },
-        {
-            "ip": "1.2.3.4",
-            "path": "/wp-admin",
-            "response_time": 0.04,
-            "status": 500,
-            "timestamp": 12.0
-        }
-    ]))
+        aiwaf_core::ParsedFeatureRecord {
+            ip: "1.2.3.4".to_string(),
+            path: "/wp-admin".to_string(),
+            response_time: 0.04,
+            status: 500,
+            timestamp: 12.0,
+        },
+    ])
     .unwrap();
-    let ip_404 = to_value(&serde_json::json!({"1.2.3.4": 2})).unwrap();
+    let ip_404 = to_value(&HashMap::from([("1.2.3.4".to_string(), 2)])).unwrap();
     let exists = js_sys::Function::new_with_args("path", "return false;");
     let exempt = js_sys::Function::new_with_args("path", "return false;");
     let statuses = to_value(&vec![200, 404]).unwrap();
@@ -131,7 +132,7 @@ fn test_training_record_helpers() {
 
     let feature = python_feature_from_record(
         Array::from(&records).get(0),
-        to_value(&serde_json::json!({"1.2.3.4": [1.0, 20.0]})).unwrap(),
+        to_value(&HashMap::from([("1.2.3.4".to_string(), vec![1.0, 20.0])])).unwrap(),
         to_value(&vec!["wp"]).unwrap(),
     )
     .unwrap();
@@ -141,7 +142,7 @@ fn test_training_record_helpers() {
 
     let features = python_features_batched(
         records,
-        to_value(&serde_json::json!({"1.2.3.4": [10.0]})).unwrap(),
+        to_value(&HashMap::from([("1.2.3.4".to_string(), vec![10.0])])).unwrap(),
         to_value(&vec!["wp"]).unwrap(),
         JsValue::NULL,
         1,
