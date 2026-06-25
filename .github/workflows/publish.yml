@@ -135,6 +135,8 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
+          rustup toolchain install nightly-x86_64-pc-windows-msvc --profile minimal --component rust-src
+          echo "RUSTUP_TOOLCHAIN=nightly-x86_64-pc-windows-msvc" >> "$GITHUB_ENV"
           echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
@@ -181,7 +183,7 @@ jobs:
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         with:
           command: build
-          args: --release --out dist --interpreter ${{ steps.setup-python.outputs.python-path }} ${{ matrix.wheel_args }}
+          args: --release --out dist --interpreter ${{ steps.setup-python.outputs.python-path }} ${{ matrix.wheel_args }} -- -Z build-std=std,panic_unwind
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           maturin-version: "1.7.4"
@@ -195,6 +197,10 @@ jobs:
           max_attempts=3
           attempt=1
           extra_maturin_args="--target ${{ matrix.target }} ${{ matrix.wheel_args }}"
+          cargo_extra_args=""
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo_extra_args="-- -Z build-std=std,panic_unwind"
+          fi
           while true; do
             if python scripts/wheel_crc_check.py dist/*.whl; then
               break
@@ -206,7 +212,7 @@ jobs:
             attempt=$((attempt + 1))
             echo "CRC failure detected, rebuilding wheels (attempt $attempt/$max_attempts)..."
             rm -rf dist "target/${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}" "target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}"
-            CARGO_TARGET_DIR="target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}" maturin build --release --out dist --interpreter "${PYTHON_SYS_EXECUTABLE}" ${extra_maturin_args}
+            CARGO_TARGET_DIR="target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}" maturin build --release --out dist --interpreter "${PYTHON_SYS_EXECUTABLE}" ${extra_maturin_args} ${cargo_extra_args}
           done
       - name: Inspect wheels (pre-normalize)
         shell: bash

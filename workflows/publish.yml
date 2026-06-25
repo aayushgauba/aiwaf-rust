@@ -30,6 +30,8 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
+          rustup toolchain install nightly-x86_64-pc-windows-msvc --profile minimal --component rust-src
+          echo "RUSTUP_TOOLCHAIN=nightly-x86_64-pc-windows-msvc" >> "$GITHUB_ENV"
           echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
@@ -38,6 +40,7 @@ jobs:
           echo "RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont" >> "$GITHUB_ENV"
 
       - name: Build wheel
+        if: matrix.os != 'windows-latest'
         uses: PyO3/maturin-action@v1
         env:
           PYTHON_SYS_EXECUTABLE: ${{ steps.setup-python.outputs.python-path }}
@@ -46,6 +49,18 @@ jobs:
           command: build
           args: --release --out dist
           sccache: true
+
+      - name: Build wheel (Windows build-std)
+        if: matrix.os == 'windows-latest'
+        uses: PyO3/maturin-action@v1
+        env:
+          CARGO_BUILD_JOBS: 1
+          PYTHON_SYS_EXECUTABLE: ${{ steps.setup-python.outputs.python-path }}
+          PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        with:
+          command: build
+          args: --release --out dist --target x86_64-pc-windows-msvc -- -Z build-std=std,panic_unwind
+          sccache: false
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
