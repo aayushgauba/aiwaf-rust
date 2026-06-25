@@ -1,12 +1,13 @@
 use aiwaf_wasm::{
-    analyze_recent_behavior, extract_features, extract_features_batch_with_state,
-    finalize_feature_state, validate_headers, IsolationForest,
+    IsolationForest, analyze_recent_behavior, build_records, extract_features,
+    extract_features_batch_with_state, finalize_feature_state, python_feature_from_record,
+    python_features_batched, rust_payload_from_records, validate_headers,
 };
+use js_sys::Array;
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use web_sys::Headers;
-
 
 #[wasm_bindgen_test]
 fn test_validate_headers() {
@@ -41,7 +42,9 @@ fn test_validate_headers_with_headers_object() {
     let opt: Option<String> = from_value(reason).unwrap();
     if opt.is_some() {
         // Surface the exact reason to help diagnose header conversion issues.
-        let s = raw.as_string().unwrap_or_else(|| "<non-string>".to_string());
+        let s = raw
+            .as_string()
+            .unwrap_or_else(|| "<non-string>".to_string());
         panic!("unexpected reason: {s}");
     }
 }
@@ -78,6 +81,77 @@ fn test_extract_features_and_state() {
     let batch = extract_features_batch_with_state(records, keywords, JsValue::NULL).unwrap();
     assert!(batch.is_object());
     let _state = finalize_feature_state().unwrap();
+}
+
+#[wasm_bindgen_test]
+fn test_training_record_helpers() {
+    let parsed = to_value(&serde_json::json!([
+        {
+            "ip": "1.2.3.4",
+            "path": "/wp-admin",
+            "response_time": 0.03,
+            "status": 404,
+            "timestamp": 10.0
+        },
+        {
+            "ip": "1.2.3.4",
+            "path": "/wp-admin",
+            "response_time": 0.04,
+            "status": 500,
+            "timestamp": 12.0
+        }
+    ]))
+    .unwrap();
+    let ip_404 = to_value(&serde_json::json!({"1.2.3.4": 2})).unwrap();
+    let exists = js_sys::Function::new_with_args("path", "return false;");
+    let exempt = js_sys::Function::new_with_args("path", "return false;");
+    let statuses = to_value(&vec![200, 404]).unwrap();
+
+    let records = build_records(
+        parsed,
+        ip_404,
+        JsValue::from(exists),
+        JsValue::from(exempt),
+        statuses,
+    )
+    .unwrap();
+    let built: Vec<aiwaf_core::BuiltFeatureRecord> = from_value(records.clone()).unwrap();
+    assert_eq!(built.len(), 2);
+    assert_eq!(built[0].path_lower, "/wp-admin");
+    assert_eq!(built[0].path_len, 9);
+    assert_eq!(built[0].status_idx, 1);
+    assert_eq!(built[1].status_idx, -1);
+    assert!(built[0].kw_check);
+    assert_eq!(built[0].total_404, 2);
+
+    let payload = rust_payload_from_records(records.clone()).unwrap();
+    let payload: Vec<aiwaf_core::FeatureRecordInput> = from_value(payload).unwrap();
+    assert_eq!(payload[0].timestamp, 10.0);
+    assert_eq!(payload[0].response_time, 0.03);
+
+    let feature = python_feature_from_record(
+        Array::from(&records).get(0),
+        to_value(&serde_json::json!({"1.2.3.4": [1.0, 20.0]})).unwrap(),
+        to_value(&vec!["wp"]).unwrap(),
+    )
+    .unwrap();
+    let feature: aiwaf_core::FeatureRecordOutput = from_value(feature).unwrap();
+    assert_eq!(feature.kw_hits, 1);
+    assert_eq!(feature.burst_count, 2);
+
+    let features = python_features_batched(
+        records,
+        to_value(&serde_json::json!({"1.2.3.4": [10.0]})).unwrap(),
+        to_value(&vec!["wp"]).unwrap(),
+        JsValue::NULL,
+        1,
+        false,
+        1,
+        1,
+    )
+    .unwrap();
+    let features: Vec<aiwaf_core::FeatureRecordOutput> = from_value(features).unwrap();
+    assert_eq!(features.len(), 2);
 }
 
 #[wasm_bindgen_test]

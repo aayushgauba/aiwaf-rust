@@ -3,7 +3,7 @@
 Rust-powered WAF heuristics compiled to WebAssembly. Provides fast, deterministic
 feature extraction and anomaly scoring in browsers and Node.
 
-Version: `0.1.9`
+Version: `0.2.0`
 
 ## Install
 
@@ -62,6 +62,13 @@ console.log(model.anomaly_score([0.3, 0.2, 0.1]));
 - `extract_features(records: Array<Record>, staticKeywords: string[]) -> Array<Record>`
 - `extract_features_batch_with_state(records, staticKeywords, state?) -> { features: Array<Record>, state: object }`
 - `finalize_feature_state() -> { features: Array<Record>, state: object }`
+- `build_records(parsed, ip404, pathExistsFn, pathExemptFn, statusIdxList) -> Array<Record>`
+- `rust_payload_from_records(records: Array<Record>) -> Array<Record>`
+- `python_feature_from_record(record, ipTimes, staticKeywords) -> Record`
+- `python_features_batched(records, ipTimes, staticKeywords, iterBatchesFn, batchSize, parallelEnabled, parallelChunkSize, maxWorkers) -> Array<Record>`
+
+`build_records` accepts parsed rows with `ip`, `path`, `response_time`, `status`, and `timestamp`.
+`timestamp` can be an epoch-second number or a JavaScript `Date`. Path callback exceptions are treated as `false`.
 
 ### Behavior Analysis
 

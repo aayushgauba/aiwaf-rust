@@ -7,7 +7,7 @@
 - Built with: `PyO3` + `maturin`
 - WASM package: `aiwaf-wasm` (npm)
 - Built with: `wasm-bindgen` + `wasm-pack`
-- Version: `0.1.9`
+- Version: `0.2.0`
 
 ## Features
 
@@ -17,6 +17,30 @@
 - Isolation Forest anomaly detection with sklearn-style API
 - Cross-platform wheel publishing (Linux, macOS, Windows)
 - WASM build for browser and bundler targets
+
+## Release Hardening
+
+Windows wheel builds configure MSVC Security Development Lifecycle checks, Control Flow Guard,
+and EH Continuation Guard for any C/C++ compilation invoked during the build:
+
+```text
+CL=/sdl /guard:cf /guard:ehcont
+CFLAGS=/sdl /guard:cf /guard:ehcont
+CXXFLAGS=/sdl /guard:cf /guard:ehcont
+LDFLAGS=/guard:cf /guard:ehcont
+LINK=/guard:cf /guard:ehcont
+```
+
+The Windows Rust build also preserves debug tables and requests CFG/EH continuation metadata
+at codegen and link time:
+
+```text
+RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont
+```
+
+Rust code is not compiled by MSVC `cl.exe`, so `/sdl` applies only to native C/C++ build steps.
+Keeping debug information is intentional for scanners that verify SDL/CFG/EH continuation metadata
+in Windows binaries.
 
 ## Installation
 
@@ -55,13 +79,25 @@ maturin develop
   Each record expects:  
   `ip` (str), `path_lower` (str), `path_len` (int), `timestamp` (float),  
   `response_time` (float), `status_idx` (int), `kw_check` (bool), `total_404` (int).  
-  Returns a list of feature dicts (includes `kw_hits`, `rate`, `burst_score`, etc.).
+  Returns feature dicts with `ip`, `path_len`, `kw_hits`, `resp_time`, `status_idx`, `burst_count`, and `total_404`.
 
 - `extract_features_batch_with_state(records: list[dict], static_keywords: list[str], state: Optional[dict]) -> dict`  
   Returns `{"features": [...], "state": {...}}` to allow incremental batches.
 
 - `finalize_feature_state() -> dict`  
   Returns an empty feature batch with a reset state.
+
+- `build_records(parsed, ip_404, path_exists_fn, path_exempt_fn, status_idx_list) -> list[dict]`  
+  Converts parsed request rows into training records, caches path existence/exemption checks per path, and treats callback errors as `False`.
+
+- `rust_payload_from_records(records: list[dict]) -> list[dict]`  
+  Converts built training records into the payload accepted by `extract_features`.
+
+- `python_feature_from_record(record, ip_times, static_keywords) -> dict`  
+  Computes one feature row from a built training record and an IP timestamp map.
+
+- `python_features_batched(records, ip_times, static_keywords, iter_batches_fn, batch_size, parallel_enabled, parallel_chunk_size, max_workers) -> list[dict]`  
+  Computes feature rows in batch-sized chunks. The Rust binding ignores Python threading controls because the work runs natively.
 
 **Behavior Analysis**
 
@@ -104,25 +140,90 @@ reason = aiwaf_rust.validate_headers_with_config(
     3,
 )
 
-# 3) Feature extraction
-features = aiwaf_rust.extract_features(
-    {
-        "ip": "1.2.3.4",
-        "path_lower": "/wp-admin",
-        "path_len": 9,
-        "timestamp": 1700000000.0,
-        "response_time": 0.03,
-        "status_idx": 3,
-        "kw_check": True,
-        "total_404": 5,
-    },
-    []
+# 3) Training record preparation + feature extraction
+records = aiwaf_rust.build_records(
+    [
+        {
+            "ip": "1.2.3.4",
+            "path": "/wp-admin",
+            "response_time": 0.03,
+            "status": 404,
+            "timestamp": 1700000000.0,
+        }
+    ],
+    {"1.2.3.4": 5},
+    lambda path: False,  # path_exists_fn
+    lambda path: False,  # path_exempt_fn
+    [200, 404, 500],
+)
+payload = aiwaf_rust.rust_payload_from_records(records)
+features = aiwaf_rust.extract_features(payload, ["wp"])
+
+# Direct feature extraction also works if records are already normalized.
+direct_features = aiwaf_rust.extract_features(
+    [
+        {
+            "ip": "1.2.3.4",
+            "path_lower": "/wp-admin",
+            "path_len": 9,
+            "timestamp": 1700000000.0,
+            "response_time": 0.03,
+            "status_idx": 1,
+            "kw_check": True,
+            "total_404": 5,
+        }
+    ],
+    ["wp"],
 )
 
-# 4) Behavior analysis
-analysis = aiwaf_rust.analyze_recent_behavior([], "1.2.3.4")
+single_feature = aiwaf_rust.python_feature_from_record(
+    records[0],
+    {"1.2.3.4": [1699999995.0, 1700000000.0]},
+    ["wp"],
+)
+batched_features = aiwaf_rust.python_features_batched(
+    records,
+    {"1.2.3.4": [1699999995.0, 1700000000.0]},
+    ["wp"],
+    lambda rows, size: [rows[i:i + size] for i in range(0, len(rows), size)],
+    256,
+    False,
+    1024,
+    1,
+)
 
-# 5) Isolation Forest
+# 4) Incremental feature extraction with state
+batch = aiwaf_rust.extract_features_batch_with_state(
+    [
+        {
+            "ip": "1.2.3.4",
+            "path_lower": "/wp-admin",
+            "path_len": 9,
+            "timestamp": 1700000000.0,
+            "response_time": 0.03,
+            "status_idx": 1,
+            "kw_check": True,
+            "total_404": 5,
+        }
+    ],
+    ["wp"],
+    None,
+)
+
+# 5) Behavior analysis
+analysis = aiwaf_rust.analyze_recent_behavior(
+    [
+        {
+            "path_lower": "/wp-admin",
+            "timestamp": 1700000000.0,
+            "status": 404,
+            "kw_check": True,
+        }
+    ],
+    ["wp"],
+)
+
+# 6) Isolation Forest
 forest = aiwaf_rust.IsolationForest(
     n_estimators=100,
     max_samples="auto",
@@ -153,7 +254,16 @@ npm install aiwaf-wasm
 Usage (bundler target):
 
 ```js
-import init, { IsolationForest, validate_headers, extract_features } from "aiwaf-wasm";
+import init, {
+  IsolationForest,
+  build_records,
+  extract_features,
+  extract_features_batch_with_state,
+  python_feature_from_record,
+  python_features_batched,
+  rust_payload_from_records,
+  validate_headers,
+} from "aiwaf-wasm";
 
 await init();
 
@@ -162,18 +272,57 @@ const reason = validate_headers({
   HTTP_ACCEPT: "text/html",
 });
 
-const feats = extract_features([
-  {
-    ip: "1.2.3.4",
-    path_lower: "/wp-admin",
-    path_len: 9,
-    timestamp: 1700000000.0,
-    response_time: 0.03,
-    status_idx: 3,
-    kw_check: true,
-    total_404: 5,
-  },
-], []);
+const records = build_records(
+  [
+    {
+      ip: "1.2.3.4",
+      path: "/wp-admin",
+      response_time: 0.03,
+      status: 404,
+      timestamp: 1700000000.0,
+    },
+  ],
+  { "1.2.3.4": 5 },
+  (path) => false,
+  (path) => false,
+  [200, 404, 500]
+);
+const payload = rust_payload_from_records(records);
+const feats = extract_features(payload, ["wp"]);
+
+const singleFeature = python_feature_from_record(
+  records[0],
+  { "1.2.3.4": [1699999995.0, 1700000000.0] },
+  ["wp"]
+);
+const batchedFeatures = python_features_batched(
+  records,
+  { "1.2.3.4": [1699999995.0, 1700000000.0] },
+  ["wp"],
+  null,
+  256,
+  false,
+  1024,
+  1
+);
+
+const directFeats = extract_features(
+  [
+    {
+      ip: "1.2.3.4",
+      path_lower: "/wp-admin",
+      path_len: 9,
+      timestamp: 1700000000.0,
+      response_time: 0.03,
+      status_idx: 1,
+      kw_check: true,
+      total_404: 5,
+    },
+  ],
+  ["wp"]
+);
+
+const batch = extract_features_batch_with_state(payload, ["wp"], null);
 
 const forest = new IsolationForest({
   n_estimators: 100,
@@ -207,6 +356,14 @@ forest2.retrain([[0.15, 1.05], [0.25, 1.2]]);
 - `extract_features(records: Array<Record>, staticKeywords: string[]) -> Array<Record>`
 - `extract_features_batch_with_state(records, staticKeywords, state?) -> { features: Array<Record>, state: object }`
 - `finalize_feature_state() -> { features: Array<Record>, state: object }`
+- `build_records(parsed, ip404, pathExistsFn, pathExemptFn, statusIdxList) -> Array<Record>`
+- `rust_payload_from_records(records: Array<Record>) -> Array<Record>`
+- `python_feature_from_record(record, ipTimes, staticKeywords) -> Record`
+- `python_features_batched(records, ipTimes, staticKeywords, iterBatchesFn, batchSize, parallelEnabled, parallelChunkSize, maxWorkers) -> Array<Record>`
+
+`build_records` accepts parsed rows with `ip`, `path`, `response_time`, `status`, and `timestamp`.
+For Python, `timestamp` can be an epoch-second number or any object with `.timestamp()`.
+For WASM, `timestamp` can be an epoch-second number or a JavaScript `Date`.
 
 **Behavior Analysis**
 

@@ -83,7 +83,6 @@ jobs:
             manylinux: "2014"
             wheel_args: ""
             build_jobs: ""
-            rustflags: ""
           - os: ubuntu-24.04-arm
             python: "3.12"
             platform_id: manylinux2014-aarch64
@@ -91,7 +90,6 @@ jobs:
             manylinux: "2014"
             wheel_args: ""
             build_jobs: ""
-            rustflags: ""
           - os: ubuntu-latest
             python: "3.12"
             platform_id: musllinux_1_2-x86_64
@@ -99,7 +97,6 @@ jobs:
             manylinux: musllinux_1_2
             wheel_args: ""
             build_jobs: ""
-            rustflags: ""
           - os: macos-14
             python: "3.12"
             platform_id: macos-arm64
@@ -107,7 +104,6 @@ jobs:
             manylinux: "off"
             wheel_args: ""
             build_jobs: ""
-            rustflags: ""
           - os: macos-14
             python: "3.12"
             platform_id: macos-x86_64
@@ -115,7 +111,6 @@ jobs:
             manylinux: "off"
             wheel_args: ""
             build_jobs: ""
-            rustflags: ""
           - os: windows-latest
             python: "3.12"
             platform_id: win-amd64
@@ -123,7 +118,6 @@ jobs:
             manylinux: "off"
             wheel_args: ""
             build_jobs: 1
-            rustflags: "-C codegen-units=1"
 
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +130,17 @@ jobs:
       - name: Clean dist
         shell: bash
         run: rm -rf dist
+
+      - name: Configure Windows SDL hardening
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "LDFLAGS=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "LINK=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont" >> "$GITHUB_ENV"
 
       - name: Build wheel (Linux container mode)
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-24.04-arm'
@@ -172,7 +177,6 @@ jobs:
           CARGO_INCREMENTAL: 0
           CARGO_TARGET_DIR: target/${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}
           CARGO_BUILD_JOBS: 1
-          RUSTFLAGS: -C codegen-units=1
           PYTHON_SYS_EXECUTABLE: ${{ steps.setup-python.outputs.python-path }}
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         with:
@@ -299,6 +303,13 @@ jobs:
         run: |
           ls -1 dist/*.tar.gz >/dev/null
           python -m tarfile -t dist/*.tar.gz
+      - name: Verify LICENSE in sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdist="$(ls dist/*.tar.gz)"
+          top_dir="$(tar -tzf "$sdist" | head -n1 | cut -d/ -f1)"
+          tar -tzf "$sdist" "${top_dir}/LICENSE" >/dev/null
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4

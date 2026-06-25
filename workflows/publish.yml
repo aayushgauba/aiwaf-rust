@@ -26,6 +26,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Configure Windows SDL hardening
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "LDFLAGS=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "LINK=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont" >> "$GITHUB_ENV"
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         env:

@@ -4,11 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "aiwaf-rust"
-version = "0.1.9"
+version = "0.2.0"
 description = "Rust-powered WAF heuristics exposed to Python via PyO3"
 readme = "README_PYPI.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+license-files = ["LICENSE"]
 authors = [
   { name = "AIWAF maintainers" }
 ]

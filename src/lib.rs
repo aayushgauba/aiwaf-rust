@@ -1,15 +1,15 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use aiwaf_core::{
-    analyze_recent_behavior as core_analyze_recent_behavior,
+    BehaviorAnalysis, BuiltFeatureRecord, Contamination, FeatureBatchResult, FeatureRecordInput,
+    FeatureRecordOutput, FeatureState, IsolationForest as CoreForest, IsolationForestState,
+    IsolationTreeState, MaxFeatures, MaxSamples, ParsedFeatureRecord, RecentEntryInput,
+    analyze_recent_behavior as core_analyze_recent_behavior, build_records as core_build_records,
     extract_features as core_extract_features,
     extract_features_batch_with_state as core_extract_features_batch_with_state,
     finalize_feature_state as core_finalize_feature_state,
+    rust_payload_from_records as core_rust_payload_from_records,
     validate_headers as core_validate_headers,
     validate_headers_with_config as core_validate_headers_with_config,
-    BehaviorAnalysis, Contamination, FeatureBatchResult, FeatureRecordInput,
-    FeatureRecordOutput, FeatureState, IsolationForest as CoreForest,
-    IsolationForestState, IsolationTreeState, MaxFeatures, MaxSamples,
-    RecentEntryInput,
 };
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -49,6 +49,13 @@ fn pydict_to_map(state: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Vec<f64>
     Ok(map)
 }
 
+fn py_timestamp_epoch(value: &PyAny) -> PyResult<f64> {
+    if let Ok(epoch) = value.extract::<f64>() {
+        return Ok(epoch);
+    }
+    value.call_method0("timestamp")?.extract::<f64>()
+}
+
 #[derive(Clone)]
 struct PyFeatureRecordInput(FeatureRecordInput);
 
@@ -66,6 +73,61 @@ impl<'py> FromPyObject<'py> for PyFeatureRecordInput {
             timestamp: get_required("timestamp")?.extract()?,
             response_time: get_required("response_time")?.extract()?,
             status_idx: get_required("status_idx")?.extract()?,
+            kw_check: get_required("kw_check")?.extract()?,
+            total_404: get_required("total_404")?.extract()?,
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct PyParsedFeatureRecord {
+    record: ParsedFeatureRecord,
+    timestamp: PyObject,
+}
+
+impl<'py> FromPyObject<'py> for PyParsedFeatureRecord {
+    fn extract(ob: &'py PyAny) -> PyResult<Self> {
+        let dict: &PyDict = ob.downcast()?;
+        let get_required = |key: &str| -> PyResult<&PyAny> {
+            dict.get_item(key)?
+                .ok_or_else(|| PyErr::new::<PyKeyError, _>(key.to_string()))
+        };
+        let timestamp = get_required("timestamp")?;
+        Ok(Self {
+            record: ParsedFeatureRecord {
+                ip: get_required("ip")?.extract()?,
+                path: get_required("path")?.extract()?,
+                response_time: get_required("response_time")?.extract()?,
+                status: get_required("status")?.extract()?,
+                timestamp: py_timestamp_epoch(timestamp)?,
+            },
+            timestamp: timestamp.into_py(ob.py()),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PyBuiltFeatureRecord(BuiltFeatureRecord);
+
+impl<'py> FromPyObject<'py> for PyBuiltFeatureRecord {
+    fn extract(ob: &'py PyAny) -> PyResult<Self> {
+        let dict: &PyDict = ob.downcast()?;
+        let get_required = |key: &str| -> PyResult<&PyAny> {
+            dict.get_item(key)?
+                .ok_or_else(|| PyErr::new::<PyKeyError, _>(key.to_string()))
+        };
+        let timestamp_epoch = match dict.get_item("timestamp_epoch")? {
+            Some(value) => value.extract::<f64>()?,
+            None => py_timestamp_epoch(get_required("timestamp")?)?,
+        };
+        Ok(Self(BuiltFeatureRecord {
+            ip: get_required("ip")?.extract()?,
+            path_len: get_required("path_len")?.extract()?,
+            path_lower: get_required("path_lower")?.extract()?,
+            resp_time: get_required("resp_time")?.extract()?,
+            status_idx: get_required("status_idx")?.extract()?,
+            timestamp: timestamp_epoch,
+            timestamp_epoch,
             kw_check: get_required("kw_check")?.extract()?,
             total_404: get_required("total_404")?.extract()?,
         }))
@@ -104,7 +166,104 @@ fn validate_headers_with_config(
     min_score: Option<i32>,
 ) -> PyResult<Option<String>> {
     let map = headers_to_map(&headers)?;
-    Ok(core_validate_headers_with_config(&map, required_headers, min_score))
+    Ok(core_validate_headers_with_config(
+        &map,
+        required_headers,
+        min_score,
+    ))
+}
+
+#[pyfunction]
+fn build_records<'py>(
+    py: Python<'py>,
+    parsed: Vec<PyParsedFeatureRecord>,
+    ip_404: HashMap<String, i32>,
+    path_exists_fn: Bound<'py, PyAny>,
+    path_exempt_fn: Bound<'py, PyAny>,
+    status_idx_list: Vec<i32>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let timestamps: Vec<PyObject> = parsed
+        .iter()
+        .map(|record| record.timestamp.clone_ref(py))
+        .collect();
+    let core_parsed: Vec<ParsedFeatureRecord> =
+        parsed.into_iter().map(|record| record.record).collect();
+    let records = core_build_records(
+        core_parsed,
+        &ip_404,
+        |path| {
+            path_exists_fn
+                .call1((path,))
+                .and_then(|value| value.extract())
+                .map_err(|_| ())
+        },
+        |path| {
+            path_exempt_fn
+                .call1((path,))
+                .and_then(|value| value.extract())
+                .map_err(|_| ())
+        },
+        &status_idx_list,
+    );
+
+    records
+        .iter()
+        .zip(timestamps.iter())
+        .map(|(record, timestamp)| built_record_to_pydict(py, record, Some(timestamp)))
+        .collect()
+}
+
+#[pyfunction]
+fn rust_payload_from_records<'py>(
+    py: Python<'py>,
+    records: Vec<PyBuiltFeatureRecord>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let core_records: Vec<BuiltFeatureRecord> =
+        records.into_iter().map(|record| record.0).collect();
+    core_rust_payload_from_records(&core_records)
+        .iter()
+        .map(|record| feature_input_to_pydict(py, record))
+        .collect()
+}
+
+#[pyfunction]
+fn python_feature_from_record<'py>(
+    py: Python<'py>,
+    rec: PyBuiltFeatureRecord,
+    ip_times: Bound<'py, PyDict>,
+    static_kw: Vec<String>,
+) -> PyResult<Py<PyDict>> {
+    let ip_times = pydict_to_epoch_map(&ip_times)?;
+    let feature = feature_from_built_record(&rec.0, &ip_times, &static_kw);
+    feature_output_to_pydict(py, &feature)
+}
+
+#[pyfunction]
+fn python_features_batched<'py>(
+    py: Python<'py>,
+    records: Vec<PyBuiltFeatureRecord>,
+    ip_times: Bound<'py, PyDict>,
+    static_kw: Vec<String>,
+    _iter_batches_fn: Bound<'py, PyAny>,
+    batch_size: i32,
+    _parallel_enabled: bool,
+    _parallel_chunk_size: i32,
+    _max_workers: i32,
+) -> PyResult<Vec<Py<PyDict>>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let batch_size = batch_size.max(1) as usize;
+    let ip_times = pydict_to_epoch_map(&ip_times)?;
+    let mut features = Vec::with_capacity(records.len());
+    for batch in records.chunks(batch_size) {
+        for rec in batch {
+            let feature = feature_from_built_record(&rec.0, &ip_times, &static_kw);
+            features.push(feature_output_to_pydict(py, &feature)?);
+        }
+    }
+    Ok(features)
 }
 
 #[pyfunction]
@@ -361,10 +520,7 @@ fn parse_contamination(value: Option<Bound<'_, PyAny>>) -> PyResult<Contaminatio
     }
 }
 
-fn tree_state_to_pydict<'py>(
-    py: Python<'py>,
-    state: &IsolationTreeState,
-) -> PyResult<Py<PyDict>> {
+fn tree_state_to_pydict<'py>(py: Python<'py>, state: &IsolationTreeState) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new_bound(py);
     dict.set_item("depth", state.depth)?;
     dict.set_item("maxDepth", state.max_depth)?;
@@ -399,11 +555,99 @@ fn feature_output_to_pydict<'py>(
     Ok(feature.into())
 }
 
+fn feature_input_to_pydict<'py>(py: Python<'py>, rec: &FeatureRecordInput) -> PyResult<Py<PyDict>> {
+    let feature = PyDict::new_bound(py);
+    feature.set_item("ip", rec.ip.clone())?;
+    feature.set_item("path_lower", rec.path_lower.clone())?;
+    feature.set_item("path_len", rec.path_len)?;
+    feature.set_item("timestamp", rec.timestamp)?;
+    feature.set_item("response_time", rec.response_time)?;
+    feature.set_item("status_idx", rec.status_idx)?;
+    feature.set_item("kw_check", rec.kw_check)?;
+    feature.set_item("total_404", rec.total_404)?;
+    Ok(feature.into())
+}
+
+fn built_record_to_pydict<'py>(
+    py: Python<'py>,
+    rec: &BuiltFeatureRecord,
+    timestamp: Option<&PyObject>,
+) -> PyResult<Py<PyDict>> {
+    let feature = PyDict::new_bound(py);
+    feature.set_item("ip", rec.ip.clone())?;
+    feature.set_item("path_len", rec.path_len)?;
+    feature.set_item("path_lower", rec.path_lower.clone())?;
+    feature.set_item("resp_time", rec.resp_time)?;
+    feature.set_item("status_idx", rec.status_idx)?;
+    match timestamp {
+        Some(value) => feature.set_item("timestamp", value.clone_ref(py))?,
+        None => feature.set_item("timestamp", rec.timestamp)?,
+    }
+    feature.set_item("timestamp_epoch", rec.timestamp_epoch)?;
+    feature.set_item("kw_check", rec.kw_check)?;
+    feature.set_item("total_404", rec.total_404)?;
+    Ok(feature.into())
+}
+
+fn pydict_to_epoch_map(state: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Vec<f64>>> {
+    let mut map = HashMap::new();
+    for (k, v) in state.iter() {
+        let key: String = k.extract()?;
+        let list = v.downcast::<PyList>()?;
+        let mut vals = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            let epoch = item
+                .extract::<f64>()
+                .or_else(|_| item.call_method0("timestamp")?.extract::<f64>())?;
+            vals.push(epoch);
+        }
+        map.insert(key, vals);
+    }
+    Ok(map)
+}
+
+fn feature_from_built_record(
+    rec: &BuiltFeatureRecord,
+    ip_times: &HashMap<String, Vec<f64>>,
+    static_kw: &[String],
+) -> FeatureRecordOutput {
+    let kw_hits = if rec.kw_check {
+        static_kw
+            .iter()
+            .filter(|kw| rec.path_lower.contains(kw.as_str()))
+            .count() as i32
+    } else {
+        0
+    };
+    let burst_count = ip_times
+        .get(&rec.ip)
+        .map(|timestamps| {
+            timestamps
+                .iter()
+                .filter(|timestamp| rec.timestamp - **timestamp <= 10.0)
+                .count() as i32
+        })
+        .unwrap_or(0);
+
+    FeatureRecordOutput {
+        ip: rec.ip.clone(),
+        path_len: rec.path_len,
+        kw_hits,
+        resp_time: rec.resp_time,
+        status_idx: rec.status_idx,
+        burst_count,
+        total_404: rec.total_404,
+    }
+}
+
 fn state_to_pydict<'py>(py: Python<'py>, state: &IsolationForestState) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new_bound(py);
     dict.set_item("nEstimators", state.n_estimators)?;
     dict.set_item("maxSamples", max_samples_to_py(py, &state.max_samples))?;
-    dict.set_item("contamination", contamination_to_py(py, &state.contamination))?;
+    dict.set_item(
+        "contamination",
+        contamination_to_py(py, &state.contamination),
+    )?;
     dict.set_item("maxFeatures", max_features_to_py(py, &state.max_features))?;
     dict.set_item("bootstrap", state.bootstrap)?;
     dict.set_item("randomState", state.random_state)?;
@@ -419,25 +663,32 @@ fn state_to_pydict<'py>(py: Python<'py>, state: &IsolationForestState) -> PyResu
         .map(|t| tree_state_to_pydict(py, t))
         .collect::<PyResult<Vec<_>>>()?;
     dict.set_item("trees", trees)?;
-    let feats = PyList::new_bound(py, state.estimators_features.iter().map(|v| {
-        PyList::new_bound(py, v.iter().copied())
-    }));
+    let feats = PyList::new_bound(
+        py,
+        state
+            .estimators_features
+            .iter()
+            .map(|v| PyList::new_bound(py, v.iter().copied())),
+    );
     dict.set_item("estimatorsFeatures", feats)?;
     Ok(dict.into())
 }
 
 fn pydict_to_tree_state(dict: &Bound<'_, PyDict>) -> PyResult<IsolationTreeState> {
-    let depth: usize = dict.get_item("depth")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("depth".to_string())
-    })?.extract()?;
-    let max_depth: usize = dict.get_item("maxDepth")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("maxDepth".to_string())
-    })?.extract()?;
+    let depth: usize = dict
+        .get_item("depth")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("depth".to_string()))?
+        .extract()?;
+    let max_depth: usize = dict
+        .get_item("maxDepth")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("maxDepth".to_string()))?
+        .extract()?;
     let split_attr: Option<usize> = dict.get_item("splitAttr")?.unwrap().extract()?;
     let split_value: Option<f64> = dict.get_item("splitValue")?.unwrap().extract()?;
-    let size: usize = dict.get_item("size")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("size".to_string())
-    })?.extract()?;
+    let size: usize = dict
+        .get_item("size")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("size".to_string()))?
+        .extract()?;
     let left = match dict.get_item("left")? {
         Some(v) if !v.is_none() => {
             let ld = v.downcast::<PyDict>()?;
@@ -464,15 +715,17 @@ fn pydict_to_tree_state(dict: &Bound<'_, PyDict>) -> PyResult<IsolationTreeState
 }
 
 fn pydict_to_state(dict: &Bound<'_, PyDict>) -> PyResult<IsolationForestState> {
-    let n_estimators: usize = dict.get_item("nEstimators")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("nEstimators".to_string())
-    })?.extract()?;
+    let n_estimators: usize = dict
+        .get_item("nEstimators")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("nEstimators".to_string()))?
+        .extract()?;
     let max_samples = parse_max_samples(dict.get_item("maxSamples")?)?;
     let contamination = parse_contamination(dict.get_item("contamination")?)?;
     let max_features = parse_max_features(dict.get_item("maxFeatures")?)?;
-    let bootstrap: bool = dict.get_item("bootstrap")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("bootstrap".to_string())
-    })?.extract()?;
+    let bootstrap: bool = dict
+        .get_item("bootstrap")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("bootstrap".to_string()))?
+        .extract()?;
     let random_state: Option<u64> = dict
         .get_item("randomState")?
         .map(|v| v.extract())
@@ -484,18 +737,18 @@ fn pydict_to_state(dict: &Bound<'_, PyDict>) -> PyResult<IsolationForestState> {
     let max_features_: usize = dict.get_item("maxFeatures_")?.unwrap().extract()?;
     let offset_: f64 = dict.get_item("offset_")?.unwrap().extract()?;
     let n_features_in_: usize = dict.get_item("nFeaturesIn_")?.unwrap().extract()?;
-    let trees_any = dict.get_item("trees")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("trees".to_string())
-    })?;
+    let trees_any = dict
+        .get_item("trees")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("trees".to_string()))?;
     let trees_list = trees_any.downcast::<PyList>()?;
     let mut trees = Vec::with_capacity(trees_list.len());
     for item in trees_list.iter() {
         let tree_dict = item.downcast::<PyDict>()?;
         trees.push(pydict_to_tree_state(&tree_dict)?);
     }
-    let feats_any = dict.get_item("estimatorsFeatures")?.ok_or_else(|| {
-        PyErr::new::<PyKeyError, _>("estimatorsFeatures".to_string())
-    })?;
+    let feats_any = dict
+        .get_item("estimatorsFeatures")?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>("estimatorsFeatures".to_string()))?;
     let feats_list = feats_any.downcast::<PyList>()?;
     let mut estimators_features = Vec::with_capacity(feats_list.len());
     for item in feats_list.iter() {
@@ -551,6 +804,10 @@ fn contamination_to_py<'py>(py: Python<'py>, value: &Contamination) -> PyObject 
 fn aiwaf_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_headers, m)?)?;
     m.add_function(wrap_pyfunction!(validate_headers_with_config, m)?)?;
+    m.add_function(wrap_pyfunction!(build_records, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_payload_from_records, m)?)?;
+    m.add_function(wrap_pyfunction!(python_feature_from_record, m)?)?;
+    m.add_function(wrap_pyfunction!(python_features_batched, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_features_batch_with_state, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_feature_state, m)?)?;

@@ -1,4 +1,5 @@
 import aiwaf_rust
+from datetime import datetime, timezone
 
 
 def test_validate_headers():
@@ -46,6 +47,66 @@ def test_extract_features_and_state():
     batch = aiwaf_rust.extract_features_batch_with_state(records, ["wp"], None)
     assert "features" in batch
     assert "state" in batch
+
+
+def test_training_record_helpers():
+    parsed = [
+        {
+            "ip": "1.2.3.4",
+            "path": "/wp-admin",
+            "response_time": 0.03,
+            "status": 404,
+            "timestamp": datetime.fromtimestamp(10, timezone.utc),
+        },
+        {
+            "ip": "1.2.3.4",
+            "path": "/wp-admin",
+            "response_time": 0.04,
+            "status": 500,
+            "timestamp": datetime.fromtimestamp(12, timezone.utc),
+        },
+    ]
+    exists_calls = []
+    exempt_calls = []
+
+    def path_exists(path):
+        exists_calls.append(path)
+        return False
+
+    def path_exempt(path):
+        exempt_calls.append(path)
+        return False
+
+    records = aiwaf_rust.build_records(
+        parsed,
+        {"1.2.3.4": 2},
+        path_exists,
+        path_exempt,
+        [200, 404],
+    )
+    assert len(exists_calls) == 1
+    assert len(exempt_calls) == 1
+    assert records[0]["path_lower"] == "/wp-admin"
+    assert records[0]["path_len"] == 9
+    assert records[0]["status_idx"] == 1
+    assert records[1]["status_idx"] == -1
+    assert records[0]["kw_check"] is True
+    assert records[0]["total_404"] == 2
+
+    payload = aiwaf_rust.rust_payload_from_records(records)
+    assert payload[0]["timestamp"] == 10.0
+    assert payload[0]["response_time"] == 0.03
+
+    feature = aiwaf_rust.python_feature_from_record(
+        records[0],
+        {"1.2.3.4": [datetime.fromtimestamp(1, timezone.utc), datetime.fromtimestamp(20, timezone.utc)]},
+        ["wp"],
+    )
+    assert feature["kw_hits"] == 1
+    assert feature["burst_count"] == 2
+
+    batched = aiwaf_rust.python_features_batched(records, {"1.2.3.4": [datetime.fromtimestamp(10, timezone.utc)]}, ["wp"], lambda rows, size: [rows], 1, False, 1, 1)
+    assert len(batched) == 2
 
 
 def test_analyze_recent_behavior():

@@ -104,9 +104,8 @@ pub fn validate_headers_with_config(
     required_headers: Option<Vec<String>>,
     min_score: Option<i32>,
 ) -> Option<String> {
-    let required = required_headers.unwrap_or_else(|| {
-        vec!["HTTP_USER_AGENT".to_string(), "HTTP_ACCEPT".to_string()]
-    });
+    let required = required_headers
+        .unwrap_or_else(|| vec!["HTTP_USER_AGENT".to_string(), "HTTP_ACCEPT".to_string()]);
     let required_set: HashSet<String> = required.iter().cloned().collect();
     let check_required = !required.is_empty();
 
@@ -121,10 +120,7 @@ pub fn validate_headers_with_config(
     }
 
     if !missing.is_empty() {
-        return Some(format!(
-            "Missing required headers: {}",
-            missing.join(", ")
-        ));
+        return Some(format!("Missing required headers: {}", missing.join(", ")));
     }
 
     let user_agent = get_header(headers, "HTTP_USER_AGENT").unwrap_or_default();
@@ -142,14 +138,10 @@ pub fn validate_headers_with_config(
         if server_protocol.starts_with("HTTP/2")
             && user_agent.to_lowercase().contains("mozilla/4.0")
         {
-            return Some(
-                "Suspicious headers: HTTP/2 with old browser user agent".to_string(),
-            );
+            return Some("Suspicious headers: HTTP/2 with old browser user agent".to_string());
         }
         if !user_agent.is_empty() && accept.is_empty() && required_set.contains("HTTP_ACCEPT") {
-            return Some(
-                "Suspicious headers: User-Agent present but no Accept header".to_string(),
-            );
+            return Some("Suspicious headers: User-Agent present but no Accept header".to_string());
         }
         if accept == "*/*" && accept_language.is_empty() && accept_encoding.is_empty() {
             return Some(
@@ -221,6 +213,28 @@ pub struct FeatureRecordInput {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ParsedFeatureRecord {
+    pub ip: String,
+    pub path: String,
+    pub response_time: f64,
+    pub status: i32,
+    pub timestamp: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BuiltFeatureRecord {
+    pub ip: String,
+    pub path_len: usize,
+    pub path_lower: String,
+    pub resp_time: f64,
+    pub status_idx: i32,
+    pub timestamp: f64,
+    pub timestamp_epoch: f64,
+    pub kw_check: bool,
+    pub total_404: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FeatureRecordOutput {
     pub ip: String,
     pub path_len: usize,
@@ -261,12 +275,82 @@ pub struct BehaviorAnalysis {
     pub should_block: bool,
 }
 
+pub fn build_records<P, E>(
+    parsed: Vec<ParsedFeatureRecord>,
+    ip_404: &HashMap<String, i32>,
+    mut path_exists_fn: P,
+    mut path_exempt_fn: E,
+    status_idx_list: &[i32],
+) -> Vec<BuiltFeatureRecord>
+where
+    P: FnMut(&str) -> Result<bool, ()>,
+    E: FnMut(&str) -> Result<bool, ()>,
+{
+    let mut records = Vec::with_capacity(parsed.len());
+    let mut known_cache: HashMap<String, bool> = HashMap::new();
+    let mut exempt_cache: HashMap<String, bool> = HashMap::new();
+
+    for record in parsed {
+        let known_path = match known_cache.get(&record.path) {
+            Some(value) => *value,
+            None => {
+                let value = path_exists_fn(&record.path).unwrap_or(false);
+                known_cache.insert(record.path.clone(), value);
+                value
+            }
+        };
+
+        let exempt = match exempt_cache.get(&record.path) {
+            Some(value) => *value,
+            None => {
+                let value = path_exempt_fn(&record.path).unwrap_or(false);
+                exempt_cache.insert(record.path.clone(), value);
+                value
+            }
+        };
+
+        let status_idx = status_idx_list
+            .iter()
+            .position(|status| *status == record.status)
+            .map(|idx| idx as i32)
+            .unwrap_or(-1);
+
+        records.push(BuiltFeatureRecord {
+            ip: record.ip.clone(),
+            path_len: record.path.chars().count(),
+            path_lower: record.path.to_lowercase(),
+            resp_time: record.response_time,
+            status_idx,
+            timestamp: record.timestamp,
+            timestamp_epoch: record.timestamp,
+            kw_check: !known_path && !exempt,
+            total_404: ip_404.get(&record.ip).copied().unwrap_or(0),
+        });
+    }
+
+    records
+}
+
+pub fn rust_payload_from_records(records: &[BuiltFeatureRecord]) -> Vec<FeatureRecordInput> {
+    records
+        .iter()
+        .map(|rec| FeatureRecordInput {
+            ip: rec.ip.clone(),
+            path_lower: rec.path_lower.clone(),
+            path_len: rec.path_len,
+            timestamp: rec.timestamp_epoch,
+            response_time: rec.resp_time,
+            status_idx: rec.status_idx,
+            kw_check: rec.kw_check,
+            total_404: rec.total_404,
+        })
+        .collect()
+}
+
 fn build_timestamp_index(records: &[FeatureRecordInput]) -> HashMap<String, Vec<f64>> {
     let mut map: HashMap<String, Vec<f64>> = HashMap::new();
     for rec in records {
-        map.entry(rec.ip.clone())
-            .or_default()
-            .push(rec.timestamp);
+        map.entry(rec.ip.clone()).or_default().push(rec.timestamp);
     }
     for timestamps in map.values_mut() {
         timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -340,9 +424,7 @@ pub fn extract_features_batch_with_state(
         .map(|kw| kw.to_lowercase())
         .collect();
 
-    let mut timestamp_index = state
-        .map(|s| s.timestamps_by_ip)
-        .unwrap_or_default();
+    let mut timestamp_index = state.map(|s| s.timestamps_by_ip).unwrap_or_default();
 
     for rec in records.iter() {
         timestamp_index
@@ -606,7 +688,11 @@ impl IsolationTree {
         }
         let n = data.len() as f64;
         let (sum, sumsq) = y.iter().fold((0.0, 0.0), |(s, ss), v| (s + v, ss + v * v));
-        let parent_var = if n > 0.0 { sumsq / n - (sum / n).powi(2) } else { 0.0 };
+        let parent_var = if n > 0.0 {
+            sumsq / n - (sum / n).powi(2)
+        } else {
+            0.0
+        };
 
         let mut best_gain = f64::NEG_INFINITY;
         let mut best_attr = None;
@@ -1045,7 +1131,10 @@ mod tests {
     #[test]
     fn validate_headers_with_config_allows_empty_required() {
         let mut headers = HashMap::new();
-        headers.insert("HTTP_USER_AGENT".to_string(), "EmailScanner/1.0".to_string());
+        headers.insert(
+            "HTTP_USER_AGENT".to_string(),
+            "EmailScanner/1.0".to_string(),
+        );
         let result = validate_headers_with_config(&headers, Some(vec![]), Some(0));
         assert!(result.is_none());
     }
@@ -1053,7 +1142,10 @@ mod tests {
     #[test]
     fn validate_headers_blocks_suspicious_user_agent() {
         let mut headers = HashMap::new();
-        headers.insert("HTTP_USER_AGENT".to_string(), "python-requests/2.25.1".to_string());
+        headers.insert(
+            "HTTP_USER_AGENT".to_string(),
+            "python-requests/2.25.1".to_string(),
+        );
         headers.insert("HTTP_ACCEPT".to_string(), "*/*".to_string());
         let result = validate_headers(&headers);
         assert!(matches!(result, Some(msg) if msg.contains("Suspicious user agent")));
@@ -1075,13 +1167,13 @@ mod tests {
     #[test]
     fn validate_headers_allows_unicode_user_agent() {
         let mut headers = HashMap::new();
-        headers.insert(
-            "HTTP_USER_AGENT".to_string(),
-            "Mozilla/5.0 ✅".to_string(),
-        );
+        headers.insert("HTTP_USER_AGENT".to_string(), "Mozilla/5.0 ✅".to_string());
         headers.insert("HTTP_ACCEPT".to_string(), "text/html".to_string());
         headers.insert("HTTP_ACCEPT_LANGUAGE".to_string(), "en-US".to_string());
-        headers.insert("HTTP_ACCEPT_ENCODING".to_string(), "gzip, deflate".to_string());
+        headers.insert(
+            "HTTP_ACCEPT_ENCODING".to_string(),
+            "gzip, deflate".to_string(),
+        );
         headers.insert("HTTP_CONNECTION".to_string(), "keep-alive".to_string());
         let result = validate_headers(&headers);
         assert!(result.is_none());
@@ -1121,6 +1213,59 @@ mod tests {
     fn extract_features_empty() {
         let features = extract_features(Vec::new(), vec![]);
         assert!(features.is_empty());
+    }
+
+    #[test]
+    fn build_records_caches_path_checks_and_converts_payload() {
+        let parsed = vec![
+            ParsedFeatureRecord {
+                ip: "1.2.3.4".to_string(),
+                path: "/wp-admin".to_string(),
+                response_time: 0.1,
+                status: 404,
+                timestamp: 10.0,
+            },
+            ParsedFeatureRecord {
+                ip: "1.2.3.4".to_string(),
+                path: "/wp-admin".to_string(),
+                response_time: 0.2,
+                status: 500,
+                timestamp: 12.0,
+            },
+        ];
+        let mut ip_404 = HashMap::new();
+        ip_404.insert("1.2.3.4".to_string(), 7);
+        let mut exists_calls = 0;
+        let mut exempt_calls = 0;
+
+        let records = build_records(
+            parsed,
+            &ip_404,
+            |_| {
+                exists_calls += 1;
+                Ok(false)
+            },
+            |_| {
+                exempt_calls += 1;
+                Ok(false)
+            },
+            &[200, 404],
+        );
+
+        assert_eq!(exists_calls, 1);
+        assert_eq!(exempt_calls, 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].path_len, 9);
+        assert_eq!(records[0].path_lower, "/wp-admin");
+        assert_eq!(records[0].status_idx, 1);
+        assert_eq!(records[1].status_idx, -1);
+        assert!(records[0].kw_check);
+        assert_eq!(records[0].total_404, 7);
+
+        let payload = rust_payload_from_records(&records);
+        assert_eq!(payload[0].timestamp, 10.0);
+        assert_eq!(payload[0].response_time, 0.1);
+        assert_eq!(payload[0].status_idx, 1);
     }
 
     #[test]
