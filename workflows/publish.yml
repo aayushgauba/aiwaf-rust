@@ -35,9 +35,34 @@ jobs:
           echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "LDFLAGS=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "LINK=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont" >> "$GITHUB_ENV"
+          echo "LDFLAGS=/guard:cf" >> "$GITHUB_ENV"
+          echo "LINK=/guard:cf" >> "$GITHUB_ENV"
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [unstable]
+          build-std = ["std", "panic_unwind"]
+          host-config = true
+          target-applies-to-host = false
+
+          [host]
+          rustflags = [
+            "-C", "codegen-units=1",
+            "-C", "debuginfo=1",
+            "-C", "strip=none",
+            "-C", "control-flow-guard=y",
+            "-C", "link-arg=/guard:cf",
+          ]
+
+          [target.x86_64-pc-windows-msvc]
+          rustflags = [
+            "-C", "codegen-units=1",
+            "-C", "debuginfo=1",
+            "-C", "strip=none",
+            "-C", "control-flow-guard=y",
+            "-C", "link-arg=/guard:cf",
+            "-C", "link-arg=/guard:ehcont",
+          ]
+          EOF
 
       - name: Build wheel
         if: matrix.os != 'windows-latest'
@@ -59,7 +84,7 @@ jobs:
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         with:
           command: build
-          args: --release --out dist --target x86_64-pc-windows-msvc -- -Z build-std=std,panic_unwind
+          args: --release --out dist --target x86_64-pc-windows-msvc
           sccache: false
 
       - name: Upload wheels

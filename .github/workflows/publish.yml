@@ -140,9 +140,34 @@ jobs:
           echo "CL=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/sdl /guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "LDFLAGS=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "LINK=/guard:cf /guard:ehcont" >> "$GITHUB_ENV"
-          echo "RUSTFLAGS=-C codegen-units=1 -C debuginfo=1 -C strip=none -C control-flow-guard=y -C link-arg=/guard:cf -C link-arg=/guard:ehcont" >> "$GITHUB_ENV"
+          echo "LDFLAGS=/guard:cf" >> "$GITHUB_ENV"
+          echo "LINK=/guard:cf" >> "$GITHUB_ENV"
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [unstable]
+          build-std = ["std", "panic_unwind"]
+          host-config = true
+          target-applies-to-host = false
+
+          [host]
+          rustflags = [
+            "-C", "codegen-units=1",
+            "-C", "debuginfo=1",
+            "-C", "strip=none",
+            "-C", "control-flow-guard=y",
+            "-C", "link-arg=/guard:cf",
+          ]
+
+          [target.x86_64-pc-windows-msvc]
+          rustflags = [
+            "-C", "codegen-units=1",
+            "-C", "debuginfo=1",
+            "-C", "strip=none",
+            "-C", "control-flow-guard=y",
+            "-C", "link-arg=/guard:cf",
+            "-C", "link-arg=/guard:ehcont",
+          ]
+          EOF
 
       - name: Build wheel (Linux container mode)
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-24.04-arm'
@@ -183,7 +208,7 @@ jobs:
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         with:
           command: build
-          args: --release --out dist --interpreter ${{ steps.setup-python.outputs.python-path }} ${{ matrix.wheel_args }} -- -Z build-std=std,panic_unwind
+          args: --release --out dist --interpreter ${{ steps.setup-python.outputs.python-path }} ${{ matrix.wheel_args }}
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           maturin-version: "1.7.4"
@@ -197,10 +222,6 @@ jobs:
           max_attempts=3
           attempt=1
           extra_maturin_args="--target ${{ matrix.target }} ${{ matrix.wheel_args }}"
-          cargo_extra_args=""
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cargo_extra_args="-- -Z build-std=std,panic_unwind"
-          fi
           while true; do
             if python scripts/wheel_crc_check.py dist/*.whl; then
               break
@@ -212,7 +233,7 @@ jobs:
             attempt=$((attempt + 1))
             echo "CRC failure detected, rebuilding wheels (attempt $attempt/$max_attempts)..."
             rm -rf dist "target/${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}" "target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}"
-            CARGO_TARGET_DIR="target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}" maturin build --release --out dist --interpreter "${PYTHON_SYS_EXECUTABLE}" ${extra_maturin_args} ${cargo_extra_args}
+            CARGO_TARGET_DIR="target/retry-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.platform_id }}-${attempt}" maturin build --release --out dist --interpreter "${PYTHON_SYS_EXECUTABLE}" ${extra_maturin_args}
           done
       - name: Inspect wheels (pre-normalize)
         shell: bash

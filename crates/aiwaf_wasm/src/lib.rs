@@ -473,6 +473,10 @@ fn get_bool(obj: &js_sys::Object, key: &str) -> Result<Option<bool>, JsValue> {
 }
 
 fn parse_parsed_records(value: JsValue) -> Result<Vec<ParsedFeatureRecord>, JsValue> {
+    if let Ok(records) = from_value::<Vec<ParsedFeatureRecord>>(value.clone()) {
+        return Ok(records);
+    }
+
     let rows = Array::from(&value);
     let mut records = Vec::with_capacity(rows.length() as usize);
     for row in rows.iter() {
@@ -525,6 +529,10 @@ fn parse_built_record(value: JsValue) -> Result<BuiltFeatureRecord, JsValue> {
 }
 
 fn parse_ip_times(value: JsValue) -> Result<HashMap<String, Vec<f64>>, JsValue> {
+    if let Ok(map) = from_value::<HashMap<String, Vec<f64>>>(value.clone()) {
+        return Ok(map);
+    }
+
     let obj = value
         .dyn_into::<js_sys::Object>()
         .map_err(|_| JsValue::from_str("ip_times must be an object"))?;
