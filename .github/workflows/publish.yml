@@ -315,7 +315,7 @@ jobs:
         run: |
           set -euo pipefail
           sdist="$(ls dist/*.tar.gz)"
-          top_dir="$(tar -tzf "$sdist" | head -n1 | cut -d/ -f1)"
+          top_dir="$(tar -tzf "$sdist" | sed -n '1s#/.*##p')"
           tar -tzf "$sdist" "${top_dir}/LICENSE" >/dev/null
 
       - name: Upload sdist
