@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Rust-powered WAF heuristics exposed to Python via PyO3"
 readme = "README_PYPI.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 authors = [
   { name = "AIWAF maintainers" }
 ]
@@ -23,3 +23,4 @@ classifiers = [
 [tool.maturin]
 manifest-path = "Cargo.toml"
 module-name = "aiwaf_rust"
+include = [{ path = "LICENSE", format = "sdist" }]
